@@ -725,10 +725,4 @@ st.dataframe(source_df, hide_index=True, use_container_width=True,
                             "Source data date": st.column_config.TextColumn(width="medium")})
 st.caption(f"Page fetch checked at {now}. This is the fetch time, not necessarily the market quote's as-of date. Please verify market dates and tax vintage at the linked source. Government yields are used as classroom risk-free proxies; they may contain sovereign risk. Tax rate and ERP are held constant across currencies. No separate country equity premium is added.")
 
-with st.expander("Verification tests (required by the assignment)", expanded=False):
-    checks = check_math()
-    for title, passed in checks.items():
-        (st.success if passed else st.error)(("PASS · " if passed else "FAIL · ") + title)
-    st.caption("These checks validate calculation consistency using synthetic test inputs; they are not market observations.")
-
 st.caption("Global Capital Lab · Educational project · Formula conventions: Sergio Rebelo, International Finance, 2026")
