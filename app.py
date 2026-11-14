@@ -27,7 +27,7 @@ BETAS_HTML = "https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datafile/Betas
 BETAS_XLS_ALT = "https://pages.stern.nyu.edu/adamodar/pc/datasets/betas.xls"
 RATINGS_URL = "https://pages.stern.nyu.edu/adamodar/New_Home_Page/datafile/ratings.html"
 OECD_URL = "https://www.oecd.org/en/publications/corporate-tax-statistics-2026_73af6222-en/full-report/statutory-corporate-income-tax-rates_ce84abb9.html"
-OECD_API_URL = "https://sdmx.oecd.org/public/rest/v1/data/OECD.CTP.TPS,DSD_TAX_CIT@DF_CIT,2.0/.A..ST..S13...?startPeriod=2023"
+OECD_API_URL = "https://sdmx.oecd.org/public/rest/data/OECD.CTP.TPS,DSD_TAX_CIT@DF_CIT,2.0/.A.CIT_C.ST..S13...?startPeriod=2024&format=csvfile"
 OECD_2024_URL = "https://www.oecd.org/en/publications/corporate-tax-statistics-2024_9c27d6e8-en/full-report/statutory-corporate-income-tax-rates_440f9286.html"
 TE_URL = "https://tradingeconomics.com/bonds"
 
@@ -260,65 +260,74 @@ def extract_oecd_tax_table(html: str) -> dict[str, float]:
     raise ValueError("OECD combined statutory country-rate table not available in page HTML")
 
 
+def parse_oecd_csv(payload: str):
+    """Read OECD SDMX flat CSV: combined statutory general-government CIT only."""
+    df = pd.read_csv(io.StringIO(payload), low_memory=False)
+    col = {str(c).strip().upper(): c for c in df.columns}
+    for required in ("REF_AREA", "TIME_PERIOD", "OBS_VALUE"):
+        if required not in col:
+            raise ValueError(f"OECD CSV missing {required}")
+    # Exact OECD data-series selection; never confuse effective or central-only rates.
+    for dimension, accepted in (("MEASURE", {"CIT_C"}),
+                                ("TARGETING", {"ST"}),
+                                ("INSTITUTIONAL_SECTOR", {"S13"})):
+        if dimension in col:
+            df = df.loc[df[col[dimension]].astype(str).str.strip().str.upper().isin(accepted)]
+    df["_year"] = pd.to_numeric(df[col["TIME_PERIOD"]], errors="coerce")
+    df["_value"] = pd.to_numeric(df[col["OBS_VALUE"]], errors="coerce")
+    df = df.loc[df["_year"].between(2020, datetime.now(timezone.utc).year)
+                & df["_value"].between(0, 60)]
+    df = df.sort_values("_year", ascending=False).drop_duplicates(subset=[col["REF_AREA"]])
+    aliases = {"USA": "United States", "GBR": "United Kingdom", "KOR": "South Korea",
+               "CZE": "Czech Republic", "TUR": "Turkey", "HKG": "Hong Kong",
+               "TWN": "Taiwan", "ARE": "United Arab Emirates"}
+    rates = {}
+    for _, row in df.iterrows():
+        code = str(row[col["REF_AREA"]]).strip().upper()
+        country_obj = pycountry.countries.get(alpha_3=code)
+        name = aliases.get(code) or (country_obj.name if country_obj else None)
+        if name:
+            rates[name] = float(row["_value"]) / 100
+    if len(rates) < 15:
+        raise ValueError(f"OECD response contained only {len(rates)} usable countries")
+    year = int(df["_year"].max())
+    return rates, year
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_oecd():
-    """OECD SDMX API; use latest reported year per jurisdiction, not an unreported 2026 year."""
+    """Official OECD SDMX dataset; use its documented /rest/data endpoint.
+
+    Requests are scoped to statutory combined general-government CIT rates.
+    Tries a recent window, then alternate valid dataset versions. Fails visibly
+    rather than silently substituting unverified taxes.
+    """
+    base = "https://sdmx.oecd.org/public/rest/data/"
+    dataset = "OECD.CTP.TPS,DSD_TAX_CIT@DF_CIT"
+    queries = [
+        ("2.0", ".A.CIT_C.ST..S13..."),
+        ("2.0", ".A..ST..S13..."),
+        ("1.0", ".A.CIT_C.ST..S13.."),
+    ]
     errors = []
-    try:
-        response = requests.get(OECD_API_URL, headers={**HEADERS, "Accept": "csvfile, text/csv;q=0.9, */*;q=0.5"}, timeout=35)
-        response.raise_for_status()
-        df = pd.read_csv(io.StringIO(response.text), low_memory=False)
-        columns = {str(c).upper(): c for c in df.columns}
-        country_col = columns.get("REF_AREA")
-        value_col = columns.get("OBS_VALUE")
-        time_col = columns.get("TIME_PERIOD")
-        if not all([country_col, value_col, time_col]):
-            raise ValueError("OECD SDMX CSV missing REF_AREA / OBS_VALUE / TIME_PERIOD")
-        df = df.loc[pd.to_numeric(df[time_col], errors="coerce").between(2020, datetime.now(timezone.utc).year)].copy()
-        # Combined statutory general-government rate: avoid central-only / effective rates.
-        # Reject ambiguous responses instead of silently selecting a different measure.
-        for field, allowed in [("MEASURE", "CIT_C"), ("TARGETING", "ST"), ("INSTITUTIONAL_SECTOR", "S13")]:
-            if field in columns:
-                values = df[columns[field]].astype(str).str.upper()
-                if not (values == allowed).any():
-                    raise ValueError(f"OECD dataset does not contain required {field}={allowed}")
-                df = df.loc[values == allowed]
-        rates = {}
-        df = df.sort_values(time_col, ascending=False).drop_duplicates(subset=[country_col], keep="first")
-        latest_year = int(pd.to_numeric(df[time_col], errors="coerce").max()) if len(df) else 0
-        for _, row in df.iterrows():
-            code = str(row[country_col]).strip()
-            val = clean_number(row[value_col])
-            if val is None or not 0 <= val <= 60:
-                continue
-            try:
-                name = pycountry.countries.get(alpha_3=code).name
-            except (AttributeError, KeyError):
-                continue
-            rates[name] = val / 100
-        # Reconcile common OECD / ISO country-name differences.
-        for iso, name in {"USA": "United States", "GBR": "United Kingdom", "KOR": "South Korea",
-                          "CZE": "Czech Republic", "TUR": "Turkey", "HKG": "Hong Kong",
-                          "TWN": "Taiwan", "ARE": "United Arab Emirates"}.items():
-            if country_col in df:
-                rows = df.loc[df[country_col].astype(str) == iso]
-                if not rows.empty:
-                    val = clean_number(rows.iloc[0][value_col])
-                    if val is not None:
-                        rates[name] = val / 100
-        if len(rates) < 15:
-            raise ValueError(f"Only {len(rates)} combined statutory rates parsed")
-        return rates, f"OECD SDMX (latest reported, through {latest_year}; country years may differ)", OECD_API_URL
-    except Exception as exc:
-        errors.append(f"SDMX: {exc}")
-    # Publication HTML fallback, only when the table has explicit labels.
-    for url, vintage in [(OECD_URL, "2026"), (OECD_2024_URL, "2024")]:
+    for version, key in queries:
+        url = (f"{base}{dataset},{version}/{key}"
+               "?startPeriod=2024&dimensionAtObservation=AllDimensions&format=csvfile")
+        try:
+            response = requests.get(url, headers={**HEADERS, "Accept": "text/csv"}, timeout=28)
+            response.raise_for_status()
+            rates, year = parse_oecd_csv(response.text)
+            return rates, f"OECD SDMX; latest observations through {year}", url
+        except Exception as exc:
+            errors.append(f"SDMX {version}: {type(exc).__name__}: {str(exc)[:160]}")
+    # OECD report HTML is not guaranteed to contain a downloadable country table.
+    for url, vintage in ((OECD_URL, "2026"), (OECD_2024_URL, "2024")):
         try:
             rates = extract_oecd_tax_table(get_html(url))
-            return rates, vintage, url
+            return rates, f"OECD publication {vintage}", url
         except Exception as exc:
-            errors.append(f"{vintage} HTML: {exc}")
-    raise RuntimeError("OECD statutory rates unavailable. Enter verified manual rates. " + " | ".join(errors))
+            errors.append(f"OECD report {vintage}: {type(exc).__name__}: {str(exc)[:120]}")
+    raise RuntimeError("OECD official data service unavailable. " + " | ".join(errors))
 
 
 def yield_from_table(html: str, country: str) -> float:
