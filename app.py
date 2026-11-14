@@ -473,7 +473,7 @@ with st.sidebar:
     auto_foreign_spread = (spread_us * (1 + rf_foreign) / (1 + rf_us)) if None not in (spread_us, rf_foreign, rf_us) else None
     foreign_spread_input = st.number_input(f"{currency} BBB spread (percentage points)", min_value=0., max_value=40.,
                                            value=round(auto_foreign_spread * 100, 4) if auto_foreign_spread is not None else 0.,
-                                           step=.1, format="%.4f", disabled=not foreign_override_on)
+                                           step=.1, format="%.4f", disabled=not foreign_override_on, key="foreign_bbb_spread_input")
     foreign_spread_override = foreign_spread_input / 100 if foreign_override_on else None
 
 st.markdown("<div class='hero'><div class='eyebrow'>CROSS-BORDER VALUATION INTELLIGENCE</div><h1>Global Capital Lab<span class='green'>.</span></h1><div class='subtitle'>Compare project financing costs in USD and local currency, using transparent market inputs and classroom formulas.</div></div>", unsafe_allow_html=True)
