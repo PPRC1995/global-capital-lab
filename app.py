@@ -486,6 +486,17 @@ CSS += """
 [data-testid="stAppViewContainer"] { background: radial-gradient(circle at 80% 0%, #14212b 0, #0a0f15 40%, #090d12 100%) !important; }
 [data-testid="stSidebar"] {background:#111a23 !important;}
 [data-testid="stSidebar"] button {font-weight:700 !important;}
+/* The global sidebar white-text rule must not override the lime button's label. */
+[data-testid="stSidebar"] [data-testid="stButton"] button,
+[data-testid="stSidebar"] [data-testid="stButton"] button p,
+[data-testid="stSidebar"] [data-testid="stButton"] button span,
+[data-testid="stSidebar"] [data-testid="stButton"] button [data-testid="stMarkdownContainer"] p {
+  color:#101820 !important;
+  -webkit-text-fill-color:#101820 !important;
+  font-weight:800 !important;
+}
+[data-testid="stSidebar"] [data-testid="stButton"] button:hover {background:#d8ff99 !important;}
+[data-testid="stSidebar"] [data-testid="stButton"] button:focus-visible {outline:2px solid #ffffff !important;outline-offset:2px;}
 [data-testid="stSidebar"] [data-testid="stWidgetLabel"] p {font-size:.91rem !important;}
 [data-testid="stSidebar"] [data-testid="stCaptionContainer"] p {color:#b8c8d5 !important;}
 [data-testid="stDownloadButton"] button {background:#c8ff72 !important;color:#0c151d !important;border-radius:10px !important;}
