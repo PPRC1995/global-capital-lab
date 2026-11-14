@@ -189,14 +189,14 @@ def fetch_betas():
         response = requests.get(BETAS_XLS, headers=HEADERS, timeout=30)
         response.raise_for_status()
         data = parse_beta_workbook(response.content)
-        return data, "Damodaran U.S. betas (official XLS)", "Workbook publication date: see source", BETAS_XLS
+        return data, "Damodaran U.S. betas (official XLS)", "Workbook date not exposed; see source", BETAS_XLS
     except Exception as exc:
         errors.append(f"Official XLS: {exc}")
     try:
         response = requests.get(BETAS_XLS_ALT, headers=HEADERS, timeout=30)
         response.raise_for_status()
         data = parse_beta_workbook(response.content)
-        return data, "Damodaran U.S. betas (official XLS alternate URL)", "Workbook publication date: see source", BETAS_XLS_ALT
+        return data, "Damodaran U.S. betas (official XLS alternate URL)", "Workbook date not exposed; see source", BETAS_XLS_ALT
     except Exception as exc:
         errors.append(f"Alternate official XLS: {exc}")
     try:
@@ -282,16 +282,18 @@ def parse_oecd_csv(payload: str):
                "CZE": "Czech Republic", "TUR": "Turkey", "HKG": "Hong Kong",
                "TWN": "Taiwan", "ARE": "United Arab Emirates"}
     rates = {}
+    observation_years = {}
     for _, row in df.iterrows():
         code = str(row[col["REF_AREA"]]).strip().upper()
         country_obj = pycountry.countries.get(alpha_3=code)
         name = aliases.get(code) or (country_obj.name if country_obj else None)
         if name:
             rates[name] = float(row["_value"]) / 100
+            observation_years[name] = int(row["_year"])
     if len(rates) < 15:
         raise ValueError(f"OECD response contained only {len(rates)} usable countries")
     year = int(df["_year"].max())
-    return rates, year
+    return rates, year, observation_years
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -316,15 +318,15 @@ def fetch_oecd():
         try:
             response = requests.get(url, headers={**HEADERS, "Accept": "text/csv"}, timeout=28)
             response.raise_for_status()
-            rates, year = parse_oecd_csv(response.text)
-            return rates, f"OECD SDMX; latest observations through {year}", url
+            rates, year, observation_years = parse_oecd_csv(response.text)
+            return rates, f"OECD SDMX; latest dataset year {year}", url, observation_years
         except Exception as exc:
             errors.append(f"SDMX {version}: {type(exc).__name__}: {str(exc)[:160]}")
     # OECD report HTML is not guaranteed to contain a downloadable country table.
     for url, vintage in ((OECD_URL, "2026"), (OECD_2024_URL, "2024")):
         try:
             rates = extract_oecd_tax_table(get_html(url))
-            return rates, f"OECD publication {vintage}", url
+            return rates, f"OECD publication {vintage}; country observation year unverified", url, {}
         except Exception as exc:
             errors.append(f"OECD report {vintage}: {type(exc).__name__}: {str(exc)[:120]}")
     raise RuntimeError("OECD official data service unavailable. " + " | ".join(errors))
@@ -354,7 +356,7 @@ def fetch_yield(country: str):
     try:
         html = get_html(TE_URL)
         val = yield_from_table(html, country)
-        return val, TE_URL, "Retrieved live; quote as-of not verified"
+        return val, TE_URL, "Quote observation date unavailable; see fetch time below"
     except Exception as exc:
         errors.append(f"Bonds table: {exc}")
     # The country page is a secondary Trading Economics source, same provider.
@@ -368,14 +370,14 @@ def fetch_yield(country: str):
                     if "10Y" in str(row.iloc[cols.index("bonds")]):
                         val = clean_number(row.iloc[cols.index("yield")])
                         if val is not None and -5 < val < 100:
-                            return val / 100, url, "Retrieved live; quote as-of not verified"
+                            return val / 100, url, "Quote observation date unavailable; see fetch time below"
         # Published summary sometimes says '10-year government bond yield ... percent'.
         text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
         m = re.search(r"10.year government bond yield[^.]{0,180}?([0-9]+(?:\.[0-9]+)?)\s*percent", text, re.I)
         if m:
             val = float(m.group(1))
             if -5 < val < 100:
-                return val / 100, url, "Retrieved live; quote as-of not verified"
+                return val / 100, url, "Quote observation date unavailable; see fetch time below"
         raise ValueError("Could not verify 10Y quote")
     except Exception as exc:
         errors.append(f"Country page: {exc}")
@@ -547,9 +549,9 @@ except Exception as exc:
     spread_us_live = None; spread_date = "Unavailable"; spread_url = RATINGS_URL
     issues.append(f"BBB spread: {exc}")
 try:
-    tax_rates, tax_vintage, tax_url = fetch_oecd()
+    tax_rates, tax_vintage, tax_url, tax_observation_years = fetch_oecd()
 except Exception as exc:
-    tax_rates = {}; tax_vintage = "Unavailable"; tax_url = OECD_URL
+    tax_rates = {}; tax_vintage = "Unavailable"; tax_url = OECD_URL; tax_observation_years = {}
     issues.append(f"OECD corporate tax rates: {exc}")
 try:
     rf_us_live, us_yield_url, us_yield_date = fetch_yield("United States")
@@ -724,7 +726,12 @@ now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 source_rows = [
     ("U.S. industry unlevered betas", beta_source, beta_date, beta_url, "Manual" if manual_beta else "Fetched"),
     ("Baa2/BBB spread · large nonfinancial", "Damodaran", spread_date, spread_url, "Manual" if manual_spread else "Fetched"),
-    ("Statutory corporate tax rates", "OECD", tax_vintage, tax_url, "Manual" if manual_tax else "Fetched"),
+    ("Statutory corporate tax rates", "OECD",
+     (f"{'United States' if tax_choice == 'U.S. tax rate' else country}: "
+      f"{tax_observation_years['United States' if tax_choice == 'U.S. tax rate' else country]}"
+      if ('United States' if tax_choice == 'U.S. tax rate' else country) in tax_observation_years
+      else tax_vintage),
+     tax_url, "Manual" if manual_tax else "Fetched"),
     ("U.S. 10Y government yield", "Trading Economics", us_yield_date, us_yield_url, "Manual" if manual_us else "Fetched"),
     (f"{country} 10Y government yield", "Trading Economics", foreign_yield_date, foreign_yield_url, "Manual" if manual_foreign else "Fetched"),
     ("Foreign BBB spread", "Classroom conversion formula", "Current calculation", "", "Manual" if foreign_override_on else "Calculated"),
