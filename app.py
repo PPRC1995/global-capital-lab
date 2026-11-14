@@ -363,6 +363,10 @@ CSS = """
 html, body, [class*='css'], [data-testid='stApp'] {font-family:'DM Sans',sans-serif;}
 [data-testid='stApp'] {background:#0b0e12;color:#f3f5f7;}
 [data-testid='stSidebar'] {background:#12171d;border-right:1px solid #28303a;}
+[data-testid='stSidebar'] label, [data-testid='stSidebar'] p, [data-testid='stSidebar'] span, [data-testid='stSidebar'] h1, [data-testid='stSidebar'] h2, [data-testid='stSidebar'] h3, [data-testid='stSidebar'] [data-testid='stCaptionContainer'] {color:#f3f5f7 !important;}
+[data-testid='stSidebar'] [data-testid='stWidgetLabel'] p {color:#f3f5f7 !important;}
+[data-testid='stSidebar'] [data-testid='stMarkdownContainer'] p {color:#e4eaf0 !important;}
+[data-testid='stSidebar'] [data-testid='stSlider'] [data-testid='stTickBar'] {color:#e4eaf0 !important;}
 h1,h2,h3 {font-family:'Space Grotesk',sans-serif;letter-spacing:-.035em;}
 h1 {font-size:3.1rem !important;}
 [data-testid='stMetric'] {background:#161c23;border:1px solid #2a343d;border-radius:16px;padding:18px 20px;}
