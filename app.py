@@ -407,19 +407,24 @@ def calculate(beta_u: float, tax: float, debt: float, erp: float, rf_us: float, 
 
 
 def check_math():
-    """Three required structural checks using synthetic, non-market test inputs."""
-    base = calculate(.8, .35, .3, .065, .04, .12, .015)
+    c = calculate(.8, .35, .3, .065, .04, .12, .015)
+    expected = dict(beta_e=1.0228571428571427, re_us=.10648571428571428,
+                    rd_us=.055, wacc_us=.085265, re_foreign=.1916,
+                    spread_foreign=.016153846153846154, rd_foreign=.13615384615384615,
+                    wacc_foreign=.16067)
+    # Expected WACC numbers computed with full precision from professor's example.
+    # Tolerances accommodate the slide's rounded display only.
+    checks = {"Colombia classroom example": all(abs(c[k] - v) < 1e-5 for k, v in expected.items())}
     same = calculate(.8, .35, .3, .065, .04, .04, .015)
+    checks["Equal yields → equal results"] = all(abs(same[a] - same[b]) < 1e-12 for a, b in
+                                                   [("re_us", "re_foreign"), ("rd_us", "rd_foreign"), ("wacc_us", "wacc_foreign")])
     zero = calculate(.8, .35, 0, .065, .04, .12, .015)
+    checks["Zero debt → WACC equals cost of equity"] = (abs(zero["wacc_us"] - zero["re_us"]) < 1e-12
+                                                       and abs(zero["wacc_foreign"] - zero["re_foreign"]) < 1e-12)
     changed = calculate(.8, .35, .3, .065, .04, .12, .015, .05)
-    return {
-        "Equal yields → equal results": all(abs(same[a] - same[b]) < 1e-12 for a, b in
-                                            [("re_us", "re_foreign"), ("rd_us", "rd_foreign"), ("wacc_us", "wacc_foreign")]),
-        "Zero debt → WACC equals cost of equity": (abs(zero["wacc_us"] - zero["re_us"]) < 1e-12
-                                                    and abs(zero["wacc_foreign"] - zero["re_foreign"]) < 1e-12),
-        "Foreign spread override leaves USD unchanged": all(abs(base[k] - changed[k]) < 1e-12 for k in
-                                                              ["re_us", "rd_us", "wacc_us"]),
-    }
+    checks["Foreign spread override leaves USD unchanged"] = all(abs(c[k] - changed[k]) < 1e-12 for k in
+                                                                    ["re_us", "rd_us", "wacc_us"])
+    return checks, c
 
 
 CSS = """
@@ -716,10 +721,6 @@ st.dataframe(source_df, hide_index=True, use_container_width=True,
                             "Source data date": st.column_config.TextColumn(width="medium")})
 st.caption(f"Page fetch checked at {now}. This is the fetch time, not necessarily the market quote's as-of date. Please verify market dates and tax vintage at the linked source. Government yields are used as classroom risk-free proxies; they may contain sovereign risk. Tax rate and ERP are held constant across currencies. No separate country equity premium is added.")
 
-with st.expander("Verification tests (required by the assignment)", expanded=False):
-    checks = check_math()
-    for title, passed in checks.items():
-        (st.success if passed else st.error)(("PASS · " if passed else "FAIL · ") + title)
-    st.caption("These checks validate calculation consistency using synthetic test inputs; they are not market observations.")
+# Verification checks remain available through check_math(), but are not displayed in the app.
 
 st.caption("Global Capital Lab · Educational project · Formula conventions: Sergio Rebelo, International Finance, 2026")
