@@ -7,6 +7,7 @@ Data are fetched at runtime. No illustrative rates are silently treated as live.
 from __future__ import annotations
 
 import io
+import json
 import re
 from datetime import datetime, timezone
 from urllib.parse import quote
@@ -23,9 +24,10 @@ st.set_page_config(page_title="Global Capital Lab | Cost of Capital", page_icon=
 
 BETAS_XLS = "https://pages.stern.nyu.edu/~adamodar/pc/datasets/betas.xls"
 BETAS_HTML = "https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datafile/Betas.html"
+BETAS_XLS_ALT = "https://pages.stern.nyu.edu/adamodar/pc/datasets/betas.xls"
 RATINGS_URL = "https://pages.stern.nyu.edu/adamodar/New_Home_Page/datafile/ratings.html"
 OECD_URL = "https://www.oecd.org/en/publications/corporate-tax-statistics-2026_73af6222-en/full-report/statutory-corporate-income-tax-rates_ce84abb9.html"
-OECD_API_URL = "https://sdmx.oecd.org/public/rest/v1/data/OECD.CTP.TPS,DSD_TAX_CIT@DF_CIT,2.0/.A..ST..S13...?startPeriod=2026&endPeriod=2026"
+OECD_API_URL = "https://sdmx.oecd.org/public/rest/v1/data/OECD.CTP.TPS,DSD_TAX_CIT@DF_CIT,2.0/.A..ST..S13...?startPeriod=2023"
 OECD_2024_URL = "https://www.oecd.org/en/publications/corporate-tax-statistics-2024_9c27d6e8-en/full-report/statutory-corporate-income-tax-rates_440f9286.html"
 TE_URL = "https://tradingeconomics.com/bonds"
 
@@ -97,51 +99,113 @@ def clean_number(value):
         return None
 
 
+def _normalized_header(value):
+    text = re.sub(r"\s+", " ", str(value)).strip().lower()
+    return re.sub(r"[^a-z0-9]+", " ", text).strip()
+
+
+def _is_industry_header(value):
+    h = _normalized_header(value)
+    return h in ("industry name", "industry", "industry group", "industry name us") or h.startswith("industry name ")
+
+
+def _is_beta_header(value):
+    h = _normalized_header(value)
+    # Exact unlevered beta only; never use cash-corrected or emerging-market beta.
+    return h == "unlevered beta" or (h.startswith("unlevered beta ") and not any(
+        bad in h for bad in ("cash", "corrected", "emerging", "adjusted")))
+
+
+
 def parse_beta_table(df: pd.DataFrame) -> dict[str, float]:
+    """Parse an industry beta table without assuming one fixed workbook layout."""
     df = df.copy()
-    df.columns = [re.sub(r"\s+", " ", str(x)).strip().lower() for x in df.columns]
-    name = next((x for x in df.columns if "industry name" in x), None)
-    beta = next((x for x in df.columns if x == "unlevered beta"), None)
-    if not name or not beta:
-        raise ValueError("Damodaran industry or unlevered-beta column missing")
-    result = {}
-    for _, row in df.iterrows():
-        industry, value = str(row[name]).strip(), clean_number(row[beta])
-        if industry and industry.lower() not in ("nan", "total market") and value is not None and value >= 0:
-            result[industry] = value
-    if len(result) < 20:
-        raise ValueError("Damodaran table incomplete")
-    return result
+    headers = [_normalized_header(c) for c in df.columns]
+    # Prefer the ordinary US industry unlevered beta; do not accidentally use
+    # the cash-corrected or emerging-markets beta column.
+    industry_indices = [i for i, h in enumerate(headers) if _is_industry_header(h)]
+    beta_indices = [i for i, h in enumerate(headers) if _is_beta_header(h)]
+    if not industry_indices or not beta_indices:
+        raise ValueError(f"Could not identify Industry Name / Unlevered Beta columns. Headings: {headers[:18]}")
+    name_idx, beta_idx = industry_indices[0], beta_indices[0]
+    out = {}
+    for row in df.itertuples(index=False, name=None):
+        if len(row) <= max(name_idx, beta_idx):
+            continue
+        industry = re.sub(r"\s+", " ", str(row[name_idx])).strip()
+        val = clean_number(row[beta_idx])
+        if industry and industry.casefold() not in ("nan", "total market", "total") and val is not None and 0 <= val < 10:
+            out[industry] = val
+    if len(out) < 20:
+        raise ValueError(f"Only {len(out)} industries parsed; need at least 20")
+    return out
+
+
+def parse_beta_workbook(content: bytes) -> dict[str, float]:
+    """Handle XLS, XLSX and header rows preceded by Damodaran's explanatory text."""
+    # Damodaran's .xls is traditionally BIFF; some mirrors return HTML or XLSX.
+    if content.lstrip()[:30].lower().startswith((b"<!doctype html", b"<html")):
+        return parse_beta_html(content.decode("utf-8", errors="replace"))
+    engine = "openpyxl" if content[:2] == b"PK" else "xlrd"
+    wb = pd.ExcelFile(io.BytesIO(content), engine=engine)
+    errors = []
+    for sheet in wb.sheet_names:
+        raw = pd.read_excel(wb, sheet_name=sheet, header=None, dtype=object)
+        for idx in range(min(65, len(raw))):
+            headings = [_normalized_header(v) for v in raw.iloc[idx].tolist()]
+            if any(_is_industry_header(h) for h in headings) and any(_is_beta_header(h) for h in headings):
+                candidate = raw.iloc[idx+1:].copy()
+                candidate.columns = raw.iloc[idx].tolist()
+                try:
+                    return parse_beta_table(candidate)
+                except ValueError as exc:
+                    errors.append(f"{sheet}, row {idx+1}: {exc}")
+    raise ValueError("No usable industry table found in workbook. " + " | ".join(errors[:3]))
+
+
+def parse_beta_html(html: str) -> dict[str, float]:
+    """Parse the HTML table without assuming the headers are the first row."""
+    soup = BeautifulSoup(html, "html.parser")
+    for table in soup.select("table"):
+        rows = table.select("tr")
+        for j, tr in enumerate(rows[:25]):
+            cells = [x.get_text(" ", strip=True) for x in tr.find_all(["th", "td"], recursive=False)]
+            heads = [_normalized_header(x) for x in cells]
+            if not (any(_is_industry_header(h) for h in heads) and any(_is_beta_header(h) for h in heads)):
+                continue
+            data = [[x.get_text(" ", strip=True) for x in rr.find_all(["th", "td"], recursive=False)] for rr in rows[j+1:]]
+            try:
+                return parse_beta_table(pd.DataFrame(data, columns=cells))
+            except (ValueError, AssertionError):
+                continue
+    raise ValueError("No valid Damodaran industry table found in HTML")
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_betas():
-    problems = []
+    """Try the professor's XLS first; fallback to Damodaran's own HTML table."""
+    errors = []
     try:
-        response = requests.get(BETAS_XLS, headers=HEADERS, timeout=25)
+        response = requests.get(BETAS_XLS, headers=HEADERS, timeout=30)
         response.raise_for_status()
-        # The xls workbook has introductory rows; locate header dynamically.
-        raw = pd.read_excel(io.BytesIO(response.content), header=None, engine="xlrd")
-        for index in range(min(35, len(raw))):
-            values = " ".join(str(x).lower() for x in raw.iloc[index].tolist())
-            if "industry name" in values and "unlevered beta" in values:
-                raw.columns = raw.iloc[index]
-                values_dict = parse_beta_table(raw.iloc[index + 1:].reset_index(drop=True))
-                return values_dict, "Damodaran XLS", "January 2026 (verify on source page)", BETAS_XLS
-        raise ValueError("Could not find the industry table header in XLS")
+        data = parse_beta_workbook(response.content)
+        return data, "Damodaran U.S. betas (official XLS)", "Workbook publication date: see source", BETAS_XLS
     except Exception as exc:
-        problems.append(f"XLS: {exc}")
+        errors.append(f"Official XLS: {exc}")
+    try:
+        response = requests.get(BETAS_XLS_ALT, headers=HEADERS, timeout=30)
+        response.raise_for_status()
+        data = parse_beta_workbook(response.content)
+        return data, "Damodaran U.S. betas (official XLS alternate URL)", "Workbook publication date: see source", BETAS_XLS_ALT
+    except Exception as exc:
+        errors.append(f"Alternate official XLS: {exc}")
     try:
         html = get_html(BETAS_HTML)
-        for table in pd.read_html(io.StringIO(html)):
-            try:
-                return parse_beta_table(table), "Damodaran HTML (fallback)", extract_source_date(html), BETAS_HTML
-            except ValueError:
-                continue
-        raise ValueError("No suitable industry table")
+        data = parse_beta_html(html)
+        return data, "Damodaran U.S. betas (official HTML)", extract_source_date(html), BETAS_HTML
     except Exception as exc:
-        problems.append(f"HTML: {exc}")
-    raise RuntimeError("Unable to fetch industry betas: " + "; ".join(problems))
+        errors.append(f"Official HTML: {exc}")
+    raise RuntimeError(" | ".join(errors))
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -198,10 +262,10 @@ def extract_oecd_tax_table(html: str) -> dict[str, float]:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_oecd():
-    """OECD SDMX API first; only accept 2026 combined general-government statutory rates."""
+    """OECD SDMX API; use latest reported year per jurisdiction, not an unreported 2026 year."""
     errors = []
     try:
-        response = requests.get(OECD_API_URL, headers={**HEADERS, "Accept": "csvfile"}, timeout=35)
+        response = requests.get(OECD_API_URL, headers={**HEADERS, "Accept": "csvfile, text/csv;q=0.9, */*;q=0.5"}, timeout=35)
         response.raise_for_status()
         df = pd.read_csv(io.StringIO(response.text), low_memory=False)
         columns = {str(c).upper(): c for c in df.columns}
@@ -210,12 +274,18 @@ def fetch_oecd():
         time_col = columns.get("TIME_PERIOD")
         if not all([country_col, value_col, time_col]):
             raise ValueError("OECD SDMX CSV missing REF_AREA / OBS_VALUE / TIME_PERIOD")
-        df = df.loc[pd.to_numeric(df[time_col], errors="coerce") == 2026].copy()
+        df = df.loc[pd.to_numeric(df[time_col], errors="coerce").between(2020, datetime.now(timezone.utc).year)].copy()
         # Combined statutory general-government rate: avoid central-only / effective rates.
+        # Reject ambiguous responses instead of silently selecting a different measure.
         for field, allowed in [("MEASURE", "CIT_C"), ("TARGETING", "ST"), ("INSTITUTIONAL_SECTOR", "S13")]:
             if field in columns:
-                df = df.loc[df[columns[field]].astype(str).str.upper() == allowed]
+                values = df[columns[field]].astype(str).str.upper()
+                if not (values == allowed).any():
+                    raise ValueError(f"OECD dataset does not contain required {field}={allowed}")
+                df = df.loc[values == allowed]
         rates = {}
+        df = df.sort_values(time_col, ascending=False).drop_duplicates(subset=[country_col], keep="first")
+        latest_year = int(pd.to_numeric(df[time_col], errors="coerce").max()) if len(df) else 0
         for _, row in df.iterrows():
             code = str(row[country_col]).strip()
             val = clean_number(row[value_col])
@@ -238,7 +308,7 @@ def fetch_oecd():
                         rates[name] = val / 100
         if len(rates) < 15:
             raise ValueError(f"Only {len(rates)} combined statutory rates parsed")
-        return rates, "2026 (OECD SDMX API)", OECD_API_URL
+        return rates, f"OECD SDMX (latest reported, through {latest_year}; country years may differ)", OECD_API_URL
     except Exception as exc:
         errors.append(f"SDMX: {exc}")
     # Publication HTML fallback, only when the table has explicit labels.
@@ -275,7 +345,7 @@ def fetch_yield(country: str):
     try:
         html = get_html(TE_URL)
         val = yield_from_table(html, country)
-        return val, TE_URL, "Live page snapshot (check site timestamp)"
+        return val, TE_URL, "Retrieved live; quote as-of not verified"
     except Exception as exc:
         errors.append(f"Bonds table: {exc}")
     # The country page is a secondary Trading Economics source, same provider.
@@ -289,14 +359,14 @@ def fetch_yield(country: str):
                     if "10Y" in str(row.iloc[cols.index("bonds")]):
                         val = clean_number(row.iloc[cols.index("yield")])
                         if val is not None and -5 < val < 100:
-                            return val / 100, url, "Live page snapshot (check site timestamp)"
+                            return val / 100, url, "Retrieved live; quote as-of not verified"
         # Published summary sometimes says '10-year government bond yield ... percent'.
         text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
         m = re.search(r"10.year government bond yield[^.]{0,180}?([0-9]+(?:\.[0-9]+)?)\s*percent", text, re.I)
         if m:
             val = float(m.group(1))
             if -5 < val < 100:
-                return val / 100, url, "Live page snapshot (check site timestamp)"
+                return val / 100, url, "Retrieved live; quote as-of not verified"
         raise ValueError("Could not verify 10Y quote")
     except Exception as exc:
         errors.append(f"Country page: {exc}")
@@ -380,6 +450,50 @@ hr {border-color:#29313a;}
 .subtitle {color:#a9b6c3;font-size:1.05rem;}
 .small {font-size:.82rem;color:#a7b3bf;}
 .green {color:#c8ff72;}
+
+/* Global Capital Lab — accessible executive dark UI */
+[data-testid="stApp"] { background: #090d12 !important; color: #f4f7fb !important; }
+[data-testid="stSidebar"] { background: #111923 !important; border-right: 1px solid #293441 !important; }
+[data-testid="stSidebar"] label, [data-testid="stSidebar"] p,
+[data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2,
+[data-testid="stSidebar"] h3, [data-testid="stSidebar"] h4,
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"],
+[data-testid="stSidebar"] [data-testid="stWidgetLabel"] { color: #edf3f9 !important; }
+[data-testid="stSidebar"] [data-testid="stCaptionContainer"] p { color: #aebdca !important; }
+[data-testid="stSidebar"] div[data-baseweb="select"] *,
+[data-testid="stSidebar"] div[data-baseweb="input"] input { color: #18222d !important; }
+[data-testid="stSidebar"] [data-testid="stSlider"] p { color: #f4f7fb !important; }
+[data-testid="stMetric"] { box-shadow: 0 6px 22px rgba(0,0,0,.16); }
+[data-testid="stAlert"] { border-radius: 12px !important; }
+[data-testid="stExpander"] { border-radius: 14px !important; border-color: #33404d !important; }
+[data-testid="stDataFrame"] { border-radius: 12px; overflow: hidden; }
+.hero { padding: 32px 36px !important; background: linear-gradient(120deg,#1b2730,#10161e) !important; border: 1px solid #33424c !important; }
+.hero h1 { color: #fff !important; }
+.hero .subtitle { color: #c1cfdb !important; }
+
+/* Clean up the data and download experience */
+[data-testid="stDownloadButton"] button {background:#c8ff72 !important;color:#0a1117 !important;border:1px solid #c8ff72 !important;font-weight:750 !important;opacity:1 !important;}
+[data-testid="stDownloadButton"] button:disabled {background:#303b46 !important;color:#d8e2eb !important;opacity:1 !important;}
+[data-testid="stApp"] [data-testid="stDataFrame"] {border:1px solid #344150 !important;border-radius:12px;}
+[data-testid="stSidebar"] [data-testid="stButton"] button {background:#c8ff72 !important;color:#0c151d !important;font-weight:700 !important;}
+[data-testid="stSidebar"] [data-testid="stCaptionContainer"] {color:#cbd5df !important;}
+[data-testid="stApp"] [data-testid="stExpander"] {background:#131b24;border:1px solid #354454;border-radius:12px;}
+[data-testid="stApp"] [data-testid="stAlert"] {border-radius:12px;}
+</style>
+"""
+CSS += """
+<style>
+[data-testid="stAppViewContainer"] { background: radial-gradient(circle at 80% 0%, #14212b 0, #0a0f15 40%, #090d12 100%) !important; }
+[data-testid="stSidebar"] {background:#111a23 !important;}
+[data-testid="stSidebar"] button {font-weight:700 !important;}
+[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p {font-size:.91rem !important;}
+[data-testid="stSidebar"] [data-testid="stCaptionContainer"] p {color:#b8c8d5 !important;}
+[data-testid="stDownloadButton"] button {background:#c8ff72 !important;color:#0c151d !important;border-radius:10px !important;}
+[data-testid="stDownloadButton"] button:disabled {background:#35404a !important;color:#e3eaf0 !important;}
+[data-testid="stMetric"] {background:linear-gradient(145deg,#18242d,#121b24) !important;border:1px solid #33434e !important;}
+[data-testid="stExpander"] {background:#131c25 !important;}
+[data-testid="stApp"] a {color:#a7ceff;}
+.hero {border:1px solid #40505d !important;box-shadow:0 14px 45px rgba(0,0,0,.20);}
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
@@ -467,7 +581,7 @@ with st.sidebar:
     rf_us = us_input / 100 if manual_us else rf_us_live
 
     manual_foreign = st.toggle("Override selected-country 10Y yield", value=rf_foreign_live is None)
-    foreign_input = st.number_input(f"{country} 10Y yield (%)", min_value=-5., max_value=100., value=round(rf_foreign_live * 100, 4) if rf_foreign_live is not None else 0., step=.1, format="%.4f", disabled=not manual_foreign)
+    foreign_input = st.number_input(f"Selected-country 10Y yield ({country}, %)", min_value=-5., max_value=100., value=round(rf_foreign_live * 100, 4) if rf_foreign_live is not None else 0., step=.1, format="%.4f", disabled=not manual_foreign)
     rf_foreign = foreign_input / 100 if manual_foreign else rf_foreign_live
     # When comparing USD to USD, a single manually overridden U.S. yield applies to both sides.
     if country == "United States" and not manual_foreign:
@@ -483,10 +597,13 @@ with st.sidebar:
 st.markdown("<div class='hero'><div class='eyebrow'>CROSS-BORDER VALUATION INTELLIGENCE</div><h1>Global Capital Lab<span class='green'>.</span></h1><div class='subtitle'>Compare project financing costs in USD and local currency, using transparent market inputs and classroom formulas.</div></div>", unsafe_allow_html=True)
 
 if issues:
-    with st.expander(f"⚠ {len(issues)} live-data source(s) unavailable — review / enter manual values", expanded=True):
+    st.warning(f"Market data: {len(issues)} source(s) unavailable. Open Data availability & troubleshooting for details; verified manual overrides remain available.")
+    with st.expander("Data availability & troubleshooting", expanded=False):
         for issue in issues:
-            st.warning(issue)
-        st.caption("Unavailable values are not replaced with fabricated market data. Turn on the corresponding manual override in the sidebar and enter a verified value.")
+            short = issue.split(":", 1)[0]
+            st.markdown(f"**{short}** — automatic retrieval unavailable. Use the matching manual override and check the source link below.")
+            st.caption(issue[:650])
+        st.caption("The app never labels an unavailable source as live. Market data refresh requires network access from Streamlit Cloud.")
 
 missing = [name for name, value in [("Unlevered beta", beta_u), ("Project tax rate", tax),
                                     ("USD BBB spread", spread_us), ("U.S. government yield", rf_us),
@@ -522,10 +639,10 @@ with right:
 comparison = pd.DataFrame({
     "Metric": ["Cost of equity", "Pretax cost of debt", "After-tax cost of debt", "WACC"],
     "USD": [c["re_us"], c["rd_us"], c["rd_us"] * (1 - tax), c["wacc_us"]],
-    currency: [c["re_foreign"], c["rd_foreign"], c["rd_foreign"] * (1 - tax), c["wacc_foreign"]],
+    f"{currency} (selected)": [c["re_foreign"], c["rd_foreign"], c["rd_foreign"] * (1 - tax), c["wacc_foreign"]],
 })
 fig = go.Figure()
-for col, color in [("USD", "#c8ff72"), (currency, "#7b95ff")]:
+for col, color in [("USD", "#c8ff72"), (f"{currency} (selected)", "#7b95ff")]:
     fig.add_trace(go.Bar(name=col, x=comparison["Metric"], y=comparison[col] * 100,
                          marker_color=color, text=[f"{x:.2%}" for x in comparison[col]], textposition="outside"))
 fig.update_layout(barmode="group", template="plotly_dark", paper_bgcolor="#0b0e12", plot_bgcolor="#0b0e12",
@@ -569,11 +686,11 @@ if betas:
     st.download_button("↓ Download all industries (CSV)", industries_df.to_csv(index=False).encode("utf-8-sig"),
                        file_name="global_capital_lab_all_industries.csv", mime="text/csv")
 else:
-    st.info("All-industry table requires a successful Damodaran data download.")
+    st.warning("The all-industry comparison requires the official Damodaran beta table. Automatic download is currently unavailable; press Refresh market data to retry. The app will not invent industry betas.")
 
 result_df = comparison.copy()
 result_df["USD"] *= 100
-result_df[currency] *= 100
+result_df[f"{currency} (selected)"] *= 100
 st.download_button("↓ Download selected comparison (CSV)", result_df.to_csv(index=False).encode("utf-8-sig"),
                    file_name="global_capital_lab_comparison.csv", mime="text/csv")
 
@@ -587,8 +704,11 @@ source_rows = [
     (f"{country} 10Y government yield", "Trading Economics", foreign_yield_date, foreign_yield_url, "Manual" if manual_foreign else "Fetched"),
     ("Foreign BBB spread", "Classroom conversion formula", "Current calculation", "", "Manual" if foreign_override_on else "Calculated"),
 ]
-st.dataframe(pd.DataFrame(source_rows, columns=["Input", "Provider", "Source data date", "Source URL", "Mode"]),
-             hide_index=True, use_container_width=True)
+source_df = pd.DataFrame(source_rows, columns=["Input", "Provider", "Source data date", "Source URL", "Mode"])
+st.dataframe(source_df, hide_index=True, use_container_width=True,
+             column_config={"Source URL": st.column_config.LinkColumn("Official source", display_text="Open source ↗"),
+                            "Input": st.column_config.TextColumn(width="large"),
+                            "Source data date": st.column_config.TextColumn(width="medium")})
 st.caption(f"Page fetch checked at {now}. This is the fetch time, not necessarily the market quote's as-of date. Please verify market dates and tax vintage at the linked source. Government yields are used as classroom risk-free proxies; they may contain sovereign risk. Tax rate and ERP are held constant across currencies. No separate country equity premium is added.")
 
 with st.expander("Verification tests (required by the assignment)", expanded=False):
