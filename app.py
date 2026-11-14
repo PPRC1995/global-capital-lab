@@ -1,4 +1,4 @@
-"""Global Capital Lab | International Cost of Capital (Sergio Rebelo class method).
+"""Global Capital Lab | International Cost of Capital.
 
 Sources: Damodaran (US sector unlevered betas and Baa2/BBB spread),
 OECD statutory corporate tax rates, Trading Economics sovereign 10Y yields.
@@ -183,7 +183,7 @@ def parse_beta_html(html: str) -> dict[str, float]:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_betas():
-    """Try the professor's XLS first; fallback to Damodaran's own HTML table."""
+    """Try the official XLS first; fallback to Damodaran's own HTML table."""
     errors = []
     try:
         response = requests.get(BETAS_XLS, headers=HEADERS, timeout=30)
@@ -395,7 +395,7 @@ def find_tax(rates: dict, country: str):
 
 def calculate(beta_u: float, tax: float, debt: float, erp: float, rf_us: float, rf_foreign: float,
               spread_us: float, spread_foreign_override: float | None = None):
-    """All rates in decimals. Exact classroom equations; no intermediate rounding."""
+    """All rates in decimals. Specified cost-of-capital equations; no intermediate rounding."""
     if not (0 <= debt < 1):
         raise ValueError("Debt share must be at least 0% and below 100%")
     if not (0 <= tax <= 1):
@@ -520,7 +520,7 @@ if "refresh_counter" not in st.session_state:
 
 with st.sidebar:
     st.markdown("### 🌐 GLOBAL CAPITAL LAB")
-    st.caption("International Valuation · Kellogg")
+    st.caption("International Valuation · Financial Analytics")
     if st.button("↻ Refresh market data", use_container_width=True):
         fetch_betas.clear(); fetch_bbb.clear(); fetch_oecd.clear(); fetch_yield.clear()
         st.session_state.refresh_counter += 1
@@ -622,7 +622,7 @@ with st.sidebar:
                       key=f"foreign_spread_computed_v2_{country}_{auto_spread_display:.4f}")
         foreign_spread_override = None
 
-st.markdown("<div class='hero'><div class='eyebrow'>CROSS-BORDER VALUATION INTELLIGENCE</div><h1>Global Capital Lab<span class='green'>.</span></h1><div class='subtitle'>Compare project financing costs in USD and local currency, using transparent market inputs and classroom formulas.</div></div>", unsafe_allow_html=True)
+st.markdown("<div class='hero'><div class='eyebrow'>CROSS-BORDER VALUATION INTELLIGENCE</div><h1>Global Capital Lab<span class='green'>.</span></h1><div class='subtitle'>Compare project financing costs in USD and local currency, using transparent market inputs and financial formulas.</div></div>", unsafe_allow_html=True)
 
 if issues:
     st.warning(f"Market data: {len(issues)} source(s) unavailable. Open Data availability & troubleshooting for details; verified manual overrides remain available.")
@@ -734,13 +734,13 @@ source_rows = [
      tax_url, "Manual" if manual_tax else "Fetched"),
     ("U.S. 10Y government yield", "Trading Economics", us_yield_date, us_yield_url, "Manual" if manual_us else "Fetched"),
     (f"{country} 10Y government yield", "Trading Economics", foreign_yield_date, foreign_yield_url, "Manual" if manual_foreign else "Fetched"),
-    ("Foreign BBB spread", "Classroom conversion formula", "Current calculation", "", "Manual" if foreign_override_on else "Calculated"),
+    ("Foreign BBB spread", "Currency conversion formula", "Current calculation", "", "Manual" if foreign_override_on else "Calculated"),
 ]
 source_df = pd.DataFrame(source_rows, columns=["Input", "Provider", "Source data date", "Source URL", "Mode"])
 st.dataframe(source_df, hide_index=True, use_container_width=True,
              column_config={"Source URL": st.column_config.LinkColumn("Official source", display_text="Open source ↗"),
                             "Input": st.column_config.TextColumn(width="large"),
                             "Source data date": st.column_config.TextColumn(width="medium")})
-st.caption(f"Page fetch checked at {now}. This is the fetch time, not necessarily the market quote's as-of date. Please verify market dates and tax vintage at the linked source. Government yields are used as classroom risk-free proxies; they may contain sovereign risk. Tax rate and ERP are held constant across currencies. No separate country equity premium is added.")
+st.caption(f"Page fetch checked at {now}. This is the fetch time, not necessarily the market quote's as-of date. Please verify market dates and tax vintage at the linked source. Government yields are used as risk-free proxies; they may contain sovereign risk. Tax rate and ERP are held constant across currencies. No separate country equity premium is added.")
 
-st.caption("Global Capital Lab · Educational project · Formula conventions: Sergio Rebelo, International Finance, 2026")
+st.caption("Global Capital Lab · Cross-Border Valuation Analytics")
